@@ -1,5 +1,5 @@
-write.table(plot_timeline, 
-            file = "plot_timeline.txt", 
+write.table(trees_dead6, 
+            file = "trees_dead6.txt", 
             sep = "\t",          
             dec = ".",           
             row.names = FALSE, 
@@ -7,9 +7,16 @@ write.table(plot_timeline,
             na = "",             
             fileEncoding = "UTF-8")
 
+write.table(fagus_1, 
+            file = "fagus_1.txt", 
+            sep = "\t",          
+            dec = ".",           
+            row.names = FALSE, 
+            quote = FALSE,       
+            na = "",             
+            fileEncoding = "UTF-8")
 
-
-# ==============================================================================
+ # ==============================================================================
 # DATA PREPARATION: UNIQUE IDs AND INVENTORY FILTERING
 # Project: Standing Deadwood Analysis (Cox Model Preparation)
 # ==============================================================================
@@ -66,6 +73,27 @@ if (na_count > 0) {
 # Extracting hierarchical levels and keeping them as separate columns
 # ------------------------------------------------------------------------------
 
+# First merge plot_id in Zofin and Ranspurk - plot_id2
+# Define the 5 specific VUK locations where plots are globally pooled
+target_sites <- c(
+  "VUK__1__Zofin__a",
+  "VUK__1__Zofin__b",
+  "VUK__1__Zofin__c",
+  "VUK__1__Zofin__d",
+  "VUK__15__Ranspurk__NA"
+)
+
+# Create plot_id2 while preserving the original plot_id for design mapping
+trees <- trees %>%
+  mutate(
+    plot_id2 = if_else(
+      composed_site_id %in% target_sites, 
+      "1", 
+      as.character(plot_id)
+    )
+  )
+
+
 trees <- trees %>%
   mutate(
     # A. Split composed_site_id by double underscores
@@ -96,9 +124,8 @@ trees <- trees %>%
       site_id, 
       sub_id, 
       site_name, 
-      plot_id,          # Joined from 'plots' table in step 2
+      plot_id2,          # Joined from 'plots' table in step 2
       inventory_type,   # Joined from 'plots' table in step 2
-      dataset, 
       sep = "_"
     )
   ) %>%
@@ -120,23 +147,19 @@ if (nrow(stem_errors) > 0) {
 # Generate the unique stem identifier
 trees <- trees %>%
   mutate(
-    # Ensure tree_id and stem_id are treated as character to avoid paste errors
-    stem_id_fix = if_else(is.na(stem_id) | stem_id == "" | stem_id == "0", "NA", as.character(stem_id)),
-    tree_id_char = as.character(tree_id),
+    # Handle missing or zero stem IDs: convert to literal "NA" string
+    stem_id_clean = if_else(is.na(stem_id) | stem_id == "" | stem_id == "0", "NA", as.character(stem_id)),
     
-    # Combine plot base with tree and stem identifiers
-    tree_unique_id = paste(plot_unique_id, tree_id_char, stem_id_fix, sep = "_")
+    # Ensure tree_id is treated as character to avoid format mismatch during concatenation
+    tree_id_clean = as.character(tree_id),
+    
+    # Concatenate the plot base with tree and stem identifiers using an underscore separator
+    tree_unique_id = paste(plot_unique_id, tree_id_clean, stem_id_clean, sep = "_")
   ) %>%
-  # Remove temporary fix columns
-  select(-stem_id_fix, -tree_id_char) %>%
-  # Final sorting by ID and Year to ensure chronological history per stem
+  # Remove temporary cleaning columns to keep the dataframe pristine
+  select(-stem_id_clean, -tree_id_clean) %>%
+  # Sort final data chronologically to maintain historical census records per stem
   arrange(tree_unique_id, inventory_year)
-
-# Final Verification
-cat("✅ TREE_UNIQUE_ID generation complete.\n")
-cat("Example ID:", trees$tree_unique_id[1], "\n")
-cat("Total rows in 'trees' table:", nrow(trees), "\n")
-
 
 # Check for any potential NAs in the final IDs
 total_nas <- sum(is.na(trees$tree_unique_id))
@@ -208,25 +231,6 @@ trees_3inv %>%
   print()
 
 
-## --- INVENTORY RANKING ----
-# Assigning chronological rank to each inventory per plot directly in the main table
-# ------------------------------------------------------------------------------
-
-trees_3inv <- trees_3inv %>%
-  group_by(plot_unique_id) %>%
-  # dense_rank sorts years chronologically and assigns 1, 2, 3...
-  mutate(rank_inventory = dense_rank(inventory_year)) %>%
-  ungroup() %>%
-  # Keep the data organized
-  arrange(tree_unique_id, inventory_year)
-
-# --- QUICK VERIFICATION ---
-cat("\n--- RANKING CHECK ---\n")
-trees_3inv %>% 
-  select(plot_unique_id, inventory_year, rank_inventory) %>% 
-  distinct() %>% 
-  head(10) %>% 
-  print()
 
 # ==============================================================================
 # CONSISTENT_ID CORRECTION and FILTRATION
@@ -363,27 +367,31 @@ status_meta <- read_delim("status.txt", delim = "\t", locale = locale(encoding =
 # ==============================================================================
 # FILTER TREES WITH AT LEAST ONE "DEAD" RECORD
 # ==============================================================================
-# DETECT BIOLOGICAL ERRORS (ZOMBIES)
-# ------------------------------------------------------------------------------
-library(dplyr)
+# IDENTIFY ZOMBIE TREES VIA CHRONOLOGICAL CUMULATIVE CHECKS
+# ==============================================================================
 
 trees_dead <- trees_consistent %>%
   group_by(tree_unique_id) %>%
+  # Filter to keep only trees that have at least one dead (snag) record
   filter(any(life == "D")) %>%
-  # Crucial: Check if 'rank_inventory' is the correct column name!
-  arrange(rank_inventory, .by_group = TRUE) %>%
+  
+  # Ensure the history is strictly ordered by real calendar years
+  arrange(inventory_year, .by_group = TRUE) %>%
+  
   mutate(
-    # Find the first record of death
-    # We use min() because we are already grouped by tree_unique_id
-    first_death_rank = min(rank_inventory[life == "D"]),
+    # Was this specific tree already recorded as dead ("D") in any previous census?
+    # cumany() turns TRUE on the first "D" and stays TRUE for all subsequent rows.
+    was_dead_before = lag(cumany(life == "D"), default = FALSE),
     
-    # Identify zombies (Alive after being Dead)
-    errorlife_record = if_else(life == "A" & rank_inventory > first_death_rank, 1, 0),
+    # A zombie record occurs if the tree is active ("A") but was already dead before
+    errorlife_record = if_else(life == "A" & was_dead_before, 1, 0),
     
-    # Mark the whole history of that tree if it ever failed
-    errorlife_tree = any(errorlife_record == 1)
+    # Flag the entire tree history if a zombie record is found anywhere
+    errorlife_tree = as.integer(any(errorlife_record == 1))
   ) %>%
-  ungroup()
+  ungroup() %>%
+  # Clean up the temporary logical tracking column
+  select(-was_dead_before)
 
 # --- REPORTING ---
 
@@ -683,8 +691,250 @@ cat("2. TARGET SITES PRESERVED TREES (Verification that small trees are safe):\n
 cat("----------------------------------------------------------------------\n")
 print(report_preserved_target_sites)
 
+# ==============================================================================
+# 1. SEQUENCE REVISION OF STATUS TRAJECTORIES
+# ==============================================================================
+
+trees_dead2b <- trees_dead2 %>%
+  # Group by plot_id2 space to track individual stem trajectories across unified plots
+  group_by(composed_site_id, plot_id2, tree_id, stem_id) %>%
+  # Sort by rank_inventory to ensure timeline flows chronologically
+  arrange(rank_inventory, .by_group = TRUE) %>%
+  mutate(
+    # Fetch status from the previous inventory record
+    previous_status = lag(status),
+    
+    # Construct sequential status transaction checkpoints
+    status_check = case_when(
+      is.na(previous_status) ~ paste0("START_", status),
+      TRUE ~ paste0(previous_status, "_", status)
+    )
+  ) %>%
+  ungroup() %>%
+  # Drop the temporary lag helper column
+  select(-previous_status)
+
+
+# ==============================================================================
+# 2. VALIDATION OF STATUS TRAJECTORIES (RECORD & TREE-LEVEL ERRORS)
+# ==============================================================================
+
+# Step A: Classify errors on individual records (rows)
+trees_dead2b <- trees_dead2b %>%
+  mutate(
+    errorstatus_record = case_when(
+      # Minor fieldwork inconsistencies allowed (to be ignored)
+      status_check %in% c("DF_DC", "AF_AC", "AF_DC") ~ 0,
+      
+      # Stump sequence violations: DP at entry cannot transition to standing/alive
+      grepl("^DP_", status_check) & !grepl("_DP$", status_check) ~ 1,
+      
+      # Zombie violations: Verified dead stems resurrecting as alive
+      status_check %in% c("DC_AC", "DC_AF", "DC_A", 
+                          "DF_AC", "DF_AF", "DF_A") ~ 1,
+      
+      # Comprehensive zombie safety net (any dead-to-alive progression)
+      grepl("^(DC_|DF_|D_)", status_check) & grepl("(_AC|_AF|_A)$", status_check) ~ 1,
+      
+      # All other status transitions are valid
+      TRUE ~ 0
+    )
+  ) %>%
+  
+  # Step B: Instantly propagate record errors to the entire tree history using plot_id2.
+  # This completely replaces the previous complex split-and-join approach (A & B tables).
+  group_by(composed_site_id, plot_id2, tree_id, stem_id) %>%
+  mutate(
+    errorstatus_tree = if_else(any(errorstatus_record == 1), 1, 0)
+  ) %>%
+  ungroup()
+
+# ==============================================================================
+# SEPARATING STUMPS (STATUS "DP") FROM THE MAIN DATASET
+# ==============================================================================
+
+# 1. Create a separate table containing ONLY stump records
+trees_dead_stumps <- trees_dead2b %>%
+  filter(status == "DP")
+
+# 2. Keep only non-stump records in the main table for threshold mapping
+trees_dead2c <- trees_dead2b %>%
+  filter(status != "DP" | is.na(status))
+
+# ==============================================================================
+# AGAIN SEPARATING TREES WITH NO DEAD IN HISTORY FROM THE MAIN DATASET
+# ==============================================================================
+# GENERATING CHRONOLOGICAL STATUS SEQUENCES FOR STEM HISTORIES
+# ==============================================================================
+
+# 1. Define the 5 target sites that require plot_id unification
+target_sites <- c("VUK__15__Ranspurk__NA", "VUK__16__Zofin__NA", "HUL__1__Zofin__NA", "HUL__2__Ranspurk__NA", "HUL__3__Boubin__NA")
+
+# 2. Create the unified plot_id2 column and ensure chronological sorting
+# We replace circle_no with plot_id2 in the sorting hierarchy
+trees_dead2c <- trees_dead2c %>%
+  mutate(
+    plot_id2 = if_else(composed_site_id %in% target_sites, "1", as.character(plot_id))
+  ) %>%
+  arrange(composed_site_id, plot_id2, tree_id, stem_id, inventory_year)
+
+# 3. Group by each unique stem context (using plot_id2) and collapse status history
+stem_sequences <- trees_dead2c %>%
+  group_by(composed_site_id, plot_id2, tree_id, stem_id) %>%
+  summarise(
+    sequence = paste(coalesce(status, "NA"), collapse = "_"),
+    .groups = "drop"
+  )
+
+# 4. Map the sequence column back to the main dataset using the updated plot_id2 key
+trees_dead2d <- trees_dead2c %>%
+  left_join(
+    stem_sequences,
+    by = c("composed_site_id", "plot_id2", "tree_id", "stem_id")
+  )
+
+# FILTERING OF ISOLATED SEQUENCES AND COMPLETELY MISSING 'D' STATUSES
+# ==============================================================================
+
+# 1. Define the specific isolated sequences to be discarded
+target_sequences <- c("A", "AC", "AF")
+
+# 2. Apply both filters in a single pipeline to create trees_dead4b
+trees_dead2e <- trees_dead2d_clean %>%
+  # Filter A: Drop exact, isolated matches only (e.g., leaves "AC_DC" untouched)
+  filter(!sequence %in% target_sequences) %>%
+  
+  # Filter B: Drop histories that never entered a standing dead phase (lack 'D')
+  filter(stringr::str_detect(sequence, "D"))
+
+
+
+
+# ==============================================================================
+# DBH THRESHOLD MAPPING
+# ==============================================================================
+
+# Clean the design dataset, ensuring thresholds exist, and convert cm to mm.
+# Include circle_no in the selection for strict spatial partitioning.
+design_clean <- design %>%
+  filter(!is.na(standing_alive_threshold), !is.na(standing_dead_threshold)) %>%
+  mutate(
+    a_threshold_mm = standing_alive_threshold * 10,
+    d_threshold_mm  = standing_dead_threshold * 10
+  ) %>%
+  select(composed_site_id, inventory_year, inventory_type, inventory_id, circle_no, plots_list, a_threshold_mm, d_threshold_mm)
+
+design_long <- design_clean %>%
+  # 1. Clean the string to remove brackets and quotes: ["1", "2"] -> 1, 2
+  mutate(plot_id = stringr::str_remove_all(plots_list, '[\"\\[\\]]')) %>%
+  # 2. Split the comma-separated string into separate rows
+  tidyr::separate_rows(plot_id, sep = ",\\s*") %>%
+  # 3. Trim any potential accidental whitespace
+  mutate(plot_id = stringr::str_trim(plot_id)) %>%
+  # 4. Remove the helper column as it is no longer needed
+  select(-plots_list)
+
+
+# STANDARD SEAMLESS JOIN
+# ------------------------------------------------------------------------------
+
+trees_dead2e <- trees_dead2e %>%
+  left_join(
+    design_long,
+    by = c("composed_site_id", "inventory_year", "inventory_id", "inventory_type", "circle_no", "plot_id")
+  )
 
 library(dplyr)
+
+# CALCULATING MAXIMUM HISTORICAL DBH AND RE-EVALUATING THRESHOLDS
+# ==============================================================================
+
+trees_dead2e <- trees_dead2e %>%
+  # 1. Group by the unique stem identifier
+  group_by(composed_site_id, plot_id2, tree_id, stem_id) %>%
+  
+  # 2. Calculate max DBH safely by checking if any valid DBH exists first
+  mutate(
+    tree_dbh_max = if_else(
+      condition = any(!is.na(dbh)),       # Is there at least one non-NA value in the group?
+      true      = max(dbh, na.rm = TRUE),  # If YES, calculate the maximum
+      false     = NA_real_                 # If NO (all are NA), assign NA straight away
+    )
+  ) %>%
+  
+  # 3. Ungroup to return to a standard flat table structure
+  ungroup()
+
+# ==============================================================================
+# EVALUATION OF DBH AGAINST THRESHOLDS
+# ==============================================================================
+
+trees_dead3 <- trees_dead2e %>%
+  mutate(
+    # 1. Check DBH thresholds for ALIVE records (life == "A")
+    a_thresh_check = case_when(
+      life == "A" & tree_dbh_max >= a_threshold_mm ~ "within",
+      life == "A" & tree_dbh_max <  a_threshold_mm ~ "under",
+      TRUE ~ NA_character_  # Returns NULL (NA) for life == "D" or any other cases
+    ),
+    
+    # 2. Check DBH thresholds for DEAD records (life == "D")
+    d_thresh_check = case_when(
+      life == "D" & tree_dbh_max >= d_threshold_mm ~ "within",
+      life == "D" & tree_dbh_max <  d_threshold_mm ~ "under",
+      TRUE ~ NA_character_  # Returns NULL (NA) for life == "A" or any other cases
+    )
+  )
+
+
+# ==============================================================================
+# STEM-LEVEL FILTERING FOR DISPARATE LIVE/DEAD THRESHOLDS
+# ==============================================================================
+
+# Step 1: Identify the UNIQUE KEYS of stems that failed the threshold 
+# on ANY single row in their history (either live or dead check)
+problematic_stem_keys <- trees_dead3 %>%
+  filter(a_thresh_check == "under" | d_thresh_check == "under") %>%
+  distinct(composed_site_id, plot_id2, tree_id, stem_id)
+
+
+# Step 2: Extract ALL historical rows for these problematic stems.
+# If a stem is under the limit as a dead tree, we pull its live history here too.
+trees_dead_under <- trees_dead3 %>%
+  semi_join(
+    problematic_stem_keys, 
+    by = c("composed_site_id", "plot_id2", "tree_id", "stem_id")
+  )
+
+
+# Step 3: Create the final clean analytical dataset (Strictly "within" always).
+# We completely purge the main dataset of any stems found in the 'under' table.
+trees_dead_thres <- trees_dead3 %>%
+  anti_join(
+    trees_dead_under, 
+    by = c("composed_site_id", "plot_id2", "tree_id", "stem_id")
+  )
+
+# DECIDING ABOUT THRESHOLDS AND FOREST TYPES GROUPS
+trees_dead4_thres2 <- trees_dead4_thres %>%
+  left_join(
+    wildcard_metadata,
+    by = c("composed_site_id")
+  )
+
+trees_dead4_thres2 <- trees_dead4_thres %>%
+  left_join(
+    # Z tabulky wildcard_metadata vybereme klíč + jen ty sloupce, které chceme
+    wildcard_metadata %>% select(composed_site_id, soil_water, soil_nutrient, fortype, EEA_fortype, ecoregion),
+    by = c("composed_site_id")
+  )
+
+
+# V QGIS z rastru připojit teploty, srážky, nadmořskou výšku (centroid nebo polygon)
+# Pak promýšlet environmntální proměnné (diskuze)
+# U starých censů může být problém, že nemáme průměrné teploty a srážky z té doby
+# - možno nadmořská výška?
+# Pro finální výběr lokalit získat jejich souřadnice (centroid)
 
 
 # ==============================================================================
@@ -692,220 +942,280 @@ library(dplyr)
 # CREATING BIRTH AND DEATH
 # ==============================================================================
 # ==============================================================================
-#
-library(dplyr)
-
-target_sites <- c("VUK__1__Zofin__a", "VUK__1__Zofin__b", "VUK__1__Zofin__c", "VUK__1__Zofin__d", "VUK__15__Ranspurk__NA")
-
-trees_dead2 <- trees_dead2 %>%
-  mutate(plot_id2 = if_else(composed_site_id %in% target_sites, "1", as.character(plot_id)))
 
 
-# 1. TIMELINE WITH RE-ALIGNED PLOT BOUNDARIES FOR ZOFIN AND RANSPURK (USING plot_id2)
+
+
+# CONSTRUCTING PLOT TIMELINE FROM TREE-LEVEL DATASET
+# CALCULATING CENSUS RANK AND BIRTH/DEATH (WITH 0 FOR UNKNOWN)
 # ==============================================================================
-# Use the updated timeline with merged plots for the 5 target VUK sites
-plot_timeline_clean <- plot_timeline %>%
-  mutate(plot_id2 = if_else(composed_site_id %in% target_sites, "1", as.character(plot_id))) %>%
-  distinct(composed_site_id, plot_id2, inventory_year, rank_inventory) %>%
+# In trees_3inv table adjusted plot_id2 is necessary
+plot_timeline <- trees_3inv %>% 
+  # 1. Select relevant tracking columns directly from trees_3inv
+  select(institute, composed_site_id, plot_id2, inventory_year) %>%
+  
+  # 2. Reduce tree-level data to unique plot-year combinations
+  distinct(institute, composed_site_id, plot_id2, inventory_year) %>%
+  filter(!is.na(inventory_year)) %>%
+  
+  # 3. Group and arrange chronologically per plot
   group_by(composed_site_id, plot_id2) %>%
-  arrange(rank_inventory, .by_group = TRUE) %>%
+  arrange(inventory_year, .by_group = TRUE) %>%
+  
+  # 4. Calculate all temporal variables, rank, and BaSTA-compliant birth/death
   mutate(
-    previous_inv_year = lag(inventory_year),
-    next_inv_year     = lead(inventory_year),
-    max_plot_rank     = max(rank_inventory, na.rm = TRUE)
+    no_inventories   = n_distinct(inventory_year),
+    rank_inventory   = row_number(),
+    
+    # Lag and Lead functions to identify neighboring census years
+    inventory_before = lag(inventory_year, order_by = inventory_year),
+    inventory_next   = lead(inventory_year, order_by = inventory_year),
+    
+    # Birth mid-point (0 if it is the first inventory)
+    birth = if_else(is.na(inventory_before), 0, (inventory_year + inventory_before) / 2),
+    
+    # Death mid-point (0 if it is the last inventory)
+    death = if_else(is.na(inventory_next), 0, (inventory_year + inventory_next) / 2)
   ) %>%
+  
+  # 5. Clean up grouping and apply final sorting
+  ungroup() %>%
+  arrange(institute, composed_site_id, plot_id2, inventory_year) 
+
+
+# In the next step, table was adjusted in table outside of R - for two overlapping plots
+# in VUK Ranspurk and Zofin
+# CALCULATE BIRTH AND DEATH MIDPOINTS FOR BIG AND SMALL PLOTS IN PLOT_TIMELINE
+# Applies for Ranspurk and Zofin
+# ==============================================================================
+
+plot_timeline_updated <- plot_timeline_new %>%
+  mutate(
+    # --- 1. BIG PLOTS (Four-census variant) ---
+    # Birth midpoint: average of current year and the previous valid census for BIG
+    birth_big = if_else(
+      is.na(inventory_before_big) | inventory_before_big == "", 
+      0, 
+      (inventory_year + as.numeric(inventory_before_big)) / 2
+    ),
+    
+    # Death midpoint: average of current year and the next valid census for BIG
+    death_big = if_else(
+      is.na(inventory_next_big) | inventory_next_big == "", 
+      0, 
+      (inventory_year + as.numeric(inventory_next_big)) / 2
+    ),
+    
+    # --- 2. SMALL PLOTS (Six-census variant) ---
+    # Birth midpoint: average of current year and the previous valid census for SMALL
+    birth_small = if_else(
+      is.na(inventory_before_small) | inventory_before_small == "", 
+      0, 
+      (inventory_year + as.numeric(inventory_before_small)) / 2
+    ),
+    
+    # Death midpoint: average of current year and the next valid census for SMALL
+    death_small = if_else(
+      is.na(inventory_next_small) | inventory_next_small == "", 
+      0, 
+      (inventory_year + as.numeric(inventory_next_small)) / 2
+    )
+  )
+
+# ADJUSTING BIRTH AND DEATH
+# ==============================================================================
+# Step 1: Create the 'big_small' column on the tree level
+# ------------------------------------------------------------------------------
+
+trees_dead5b <- trees_dead5 %>%
+  group_by(tree_unique_id) %>%
+  mutate(
+    # A. Basic site and year tracking
+    is_ranspurk      = any(grepl("Ranspurk", tree_unique_id)),
+    has_ranspurk_yrs = any(inventory_year %in% c(2015, 2025)),
+    
+    is_zofin         = any(grepl("Zofin", tree_unique_id)),
+    has_zofin_yrs    = any(inventory_year %in% c(2012, 2017)),
+    
+    # B. DBH tracking for Ranšpurk edge-cases (trees only recorded in 2020)
+    # Check if the tree has ONLY a 2020 record and belongs to the small DBH group
+    is_only_2020_small_dbh = any(inventory_year == 2020) & 
+      n_distinct(inventory_year) == 1 & 
+      any(dbh_group == "10-99mm"), # Adjust column name if needed
+    
+    # C. Comprehensive classification logic
+    big_small = case_when(
+      # If it's Ranšpurk and is small DBH found only in 2020 -> must be "small"
+      is_ranspurk & is_only_2020_small_dbh ~ "small",
+      
+      # Standard Ranšpurk rules
+      is_ranspurk & has_ranspurk_yrs        ~ "small",
+      is_ranspurk & !has_ranspurk_yrs       ~ "big",
+      
+      # Standard Žofín rules
+      is_zofin & has_zofin_yrs              ~ "small",
+      is_zofin & !has_zofin_yrs              ~ "big",
+      
+      # Default for all other standard sites
+      TRUE                                  ~ "small"
+    )
+  ) %>%
+  ungroup() %>%
+  # Clean up temporary logical flags
+  select(-is_ranspurk, -has_ranspurk_yrs, -is_zofin, -has_zofin_yrs, -is_only_2020_small_dbh)
+
+# STEP 2: PREPARE TIMELINE LOOKUPS DIRECTLY VIA CALENDAR YEARS
+# ==============================================================================
+# We extract clean lookups from 'plot_timeline_updated' using years as keys.
+# We ensure year columns are numeric and remove any row duplicates caused by sub-plots.
+
+# 2A. Lookup table for BIG plots (fetching birth_big and death_big)
+timeline_big <- plot_timeline_updated %>%
+  filter(!is.na(inventory_year_big) & inventory_year_big != "") %>%
+  mutate(inventory_year = as.numeric(inventory_year_big)) %>%
+  select(composed_site_id, inventory_year, birth = birth_big, death = death_big) %>%
+  distinct(composed_site_id, inventory_year, .keep_all = TRUE)
+
+# 2B. Lookup table for SMALL plots (fetching birth_small and death_small)
+timeline_small <- plot_timeline_updated %>%
+  filter(!is.na(inventory_year_small) & inventory_year_small != "") %>%
+  mutate(inventory_year = as.numeric(inventory_year_small)) %>%
+  select(composed_site_id, inventory_year, birth = birth_small, death = death_small) %>%
+  distinct(composed_site_id, inventory_year, .keep_all = TRUE)
+
+
+# ==============================================================================
+# STEP 3: SPLIT DATASETS, CALCULATE FIRST/LAST SNAG YEARS, AND JOIN
+# ==============================================================================
+# Data is separated by 'big_small'. For each tree, we find its absolute first and 
+# last calendar year as a snag ("D"). These fixed years are used for the timeline join.
+
+# --- 3A. PROCESS BIG PLOTS ---
+trees_big_joined <- trees_dead5_prepped %>%
+  filter(big_small == "big") %>%
+  group_by(tree_unique_id) %>%
+  mutate(
+    # Find the absolute first and last calendar year where this tree was a snag ("D")
+    first_d_year = min(inventory_year[life == "D"]),
+    last_d_year  = max(inventory_year[life == "D"])
+  ) %>%
+  ungroup() %>%
+  # Join BIRTH: Based on the FIRST year it became a snag
+  left_join(
+    timeline_big %>% select(composed_site_id, inventory_year, birth), 
+    by = c("composed_site_id", "first_d_year" = "inventory_year")
+  ) %>%
+  # Join DEATH: Based on the LAST year it was seen standing
+  left_join(
+    timeline_big %>% select(composed_site_id, inventory_year, death), 
+    by = c("composed_site_id", "last_d_year" = "inventory_year")
+  )
+
+
+# --- 3B. PROCESS SMALL PLOTS ---
+trees_small_joined <- trees_dead5_prepped %>%
+  filter(big_small == "small") %>%
+  group_by(tree_unique_id) %>%
+  mutate(
+    # Find the absolute first and last calendar year where this tree was a snag ("D")
+    first_d_year = min(inventory_year[life == "D"]),
+    last_d_year  = max(inventory_year[life == "D"])
+  ) %>%
+  ungroup() %>%
+  # Join BIRTH: Based on the FIRST year it became a snag
+  left_join(
+    timeline_small %>% select(composed_site_id, inventory_year, birth), 
+    by = c("composed_site_id", "first_d_year" = "inventory_year")
+  ) %>%
+  # Join DEATH: Based on the LAST year it was seen standing
+  left_join(
+    timeline_small %>% select(composed_site_id, inventory_year, death), 
+    by = c("composed_site_id", "last_d_year" = "inventory_year")
+  )
+
+
+# ==============================================================================
+# STEP 4: RECOMBINE AND PRESERVE NA VALUES FOR QUALITY CONTROL
+# ==============================================================================
+# We merge the datasets back together and sort them chronologically.
+
+trees_dead5_final <- bind_rows(trees_big_joined, trees_small_joined) %>%
+  # Arrange chronologically to maintain historical sequence per tree stem
+  arrange(tree_unique_id, inventory_year)
+# Assign birth and death according to life change
+# ==============================================================================
+
+
+# TIME_TYPE (left-truncated, ...)
+# ==============================================================================
+
+
+# ==============================================================================
+# EXTRACT INITIAL DBH AT FIRST SNAG DETECTION (DBH_FIRST)
+# ==============================================================================
+# Code is still not working, need to fix it. A lot of trees with numeric dbh
+# receives dbh_first NA
+
+trees_dead6 <- trees_dead5_final %>%
+  group_by(tree_unique_id) %>%
+  mutate(
+    # 1. Exact DBH at the first snag year (returns NA if not found)
+    exact_dbh = na.omit(if_else(inventory_year == first_d_year, dbh, NA_real_))[1],
+    
+    # 2. Closest DBH BEFORE first snag year (we take the LAST/LATEST one available)
+    prev_dbh  = last(na.omit(if_else(inventory_year < first_d_year, dbh, NA_real_))),
+    
+    # 3. Closest DBH AFTER first snag year (we take the FIRST/EARLIEST one available)
+    next_dbh  = first(na.omit(if_else(inventory_year > first_d_year, dbh, NA_real_)))
+  ) %>%
+  # 4. Combine into final dbh_first using the requested hierarchy
+  mutate(
+    dbh_first = case_when(
+      is.na(first_d_year) ~ NA_real_,
+      !is.na(exact_dbh)   ~ exact_dbh,
+      !is.na(prev_dbh)    ~ prev_dbh,
+      !is.na(next_dbh)    ~ next_dbh,
+      TRUE                ~ NA_real_
+    )
+  ) %>%
+  # Clean up temporary columns and ungroup
+  select(-exact_dbh, -prev_dbh, -next_dbh) %>%
   ungroup()
 
-
-# 2. SURVIVAL METRICS AGGREGATION (STREAMLINED SITE-PLOT-TREE HIERARCHY)
 # ==============================================================================
-# Extract unified survival intervals and censoring parameters per stem
-stem_survival_metrics <- trees_dead2 %>%
-  left_join(
-    plot_timeline_clean, 
-    by = c("composed_site_id", "plot_id2", "inventory_year", "rank_inventory")
-  ) %>%
-  group_by(composed_site_id, plot_id2, tree_id, stem_id) %>%
-  summarise(
-    has_standing_dead   = any(status %in% c("DC", "DF", "D"), na.rm = TRUE),
-    year_entry_dead     = if_else(has_standing_dead, min(inventory_year[status %in% c("DC", "DF", "D") & rank_inventory == first_death_rank], na.rm = TRUE), NA_real_),
-    year_last_standing  = if_else(has_standing_dead, max(inventory_year[status %in% c("DC", "DF", "D")], na.rm = TRUE), NA_real_),
-    rank_last_standing  = if_else(has_standing_dead, max(rank_inventory[status %in% c("DC", "DF", "D")], na.rm = TRUE), NA_real_),
-    
-    # Secure cohort parameters from full study timeline
-    first_death_rank    = min(first_death_rank, na.rm = TRUE),
-    year_alive_prior    = if_else(has_standing_dead, min(previous_inv_year[rank_inventory == first_death_rank], na.rm = TRUE), NA_real_),
-    next_inv_post_dead  = if_else(has_standing_dead, min(next_inv_year[rank_inventory == max(rank_inventory[status %in% c("DC", "DF", "D")], na.rm = TRUE)], na.rm = TRUE), NA_real_),
-    
-    first_obs_is_stump  = any(status == "DP" & rank_inventory == first_death_rank, na.rm = TRUE),
-    has_turned_stump    = any(status == "DP" & inventory_year > year_last_standing, na.rm = TRUE),
-    year_stump_observed = if_else(has_turned_stump, min(inventory_year[status == "DP" & inventory_year > year_last_standing], na.rm = TRUE), NA_real_),
-    max_plot_rank       = max_plot_rank[1],
-    
-    # Exclude rows with data validation errors from risk set
-    is_invalid_history  = any(errorlife_tree == TRUE | errorlife_record == 1 | is.na(life) | is.na(errorlife_tree), na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(across(c(year_entry_dead, year_last_standing, year_stump_observed, year_alive_prior, next_inv_post_dead), 
-                ~ if_else(is.infinite(.x), NA_real_, .x)))
-
-
-# 3. ESTIMATION OF INITIALIZATION (BIRTH_2) AND CENSORING/EVENT TIMES (DEATH_2)
+# IDENTIFY SPECIES STABILITY AND CLEAN UNKNOWN TAXONS PER STEM
 # ==============================================================================
-# Pure mathematical midpoint estimations over the unified plot space
-stem_numeric_intervals <- stem_survival_metrics %>%
+
+trees_dead6 <- trees_dead6 %>%
+  group_by(tree_unique_id) %>%
   mutate(
-    birth = case_when(
-      is_invalid_history | first_obs_is_stump | !has_standing_dead ~ NA_real_,
-      first_death_rank == 1 ~ 0, # Left-truncated entry
-      !is.na(year_alive_prior) & !is.na(year_entry_dead) ~ (year_alive_prior + year_entry_dead) / 2, # Interval entry
-      TRUE ~ NA_real_
-    ),
-    death = case_when(
-      is_invalid_history | !has_standing_dead ~ NA_real_,
-      rank_last_standing == max_plot_rank & !has_turned_stump ~ 0, # Right-censored at study termination
-      has_turned_stump ~ (year_last_standing + year_stump_observed) / 2, # Event time: Transition to stump
-      !is.na(year_last_standing) & !is.na(next_inv_post_dead) ~ (year_last_standing + next_inv_post_dead) / 2, # Event time: Missing row interpolation
-      TRUE ~ NA_real_
-    )
-  )
-
-
-# 4. FINAL ASSEMBLY AND TREE-LEVEL COHORT & CENSORING CLASSIFICATION
-# ==============================================================================
-trees_dead3 <- trees_dead2 %>%
-  # Link estimated interval endpoints back to the master dataset
-  left_join(
-    stem_numeric_intervals %>% select(
-      composed_site_id, plot_id2, tree_id, stem_id, birth, death, 
-      is_invalid_history, has_standing_dead, first_obs_is_stump, has_turned_stump
-    ), 
-    by = c("composed_site_id", "plot_id2", "tree_id", "stem_id")
-  ) %>%
-  
-  # Grouping strictly by tree history to guarantee uniform flags across records
-  group_by(composed_site_id, plot_id2, tree_id, stem_id) %>%
-  mutate(
-    birth_null = if_else(all(is.na(birth)), 1, 0),
-    death_null = if_else(all(is.na(death)), 1, 0),
+    # 1. Gather all unique scientific names recorded for this specific stem history,
+    # completely ignoring generic "Unknown" placeholders and NA values.
+    valid_species_list = list(unique(full_scientific[!full_scientific %in% c("Unknown broadleaf", "Unknown species", "Unknown conifer", NA, "")])),
     
-    trajectory_note = case_when(
-      is_invalid_history & any(is.na(life) | is.na(errorlife_tree)) ~ "missing",
-      is_invalid_history ~ "error",
-      birth == 0 & death == 0 ~ "left-t & right-c",
-      !has_standing_dead & first_obs_is_stump ~ "from alive to stump",
-      !has_standing_dead ~ "no standing dead record",
-      birth == 0 ~ "left-truncated",
-      is.na(birth) & first_obs_is_stump ~ "from alive to stump",
-      first_death_rank > 1 & !((first_death_rank - 1) %in% rank_inventory) ~ "dead recruit",
-      death == 0 ~ "right-censored",
-      has_turned_stump ~ "censored (to stump)",
-      TRUE ~ "censored (to decomposed)"
+    # 2. Count how many distinct, valid species names exist in the stem's timeline
+    distinct_real_species_count = length(valid_species_list[[1]]),
+    
+    # 3. Apply classification logic to handle taxonomy issues over time:
+    tree_species = case_when(
+      # If more than one valid species name is found, the taxonomy changed (error)
+      distinct_real_species_count > 1 ~ "changed",
+      
+      # If exactly one valid species name is found, assign it to the entire stem history
+      distinct_real_species_count == 1 ~ valid_species_list[[1]][1],
+      
+      # If the stem never had a specific name and was always unknown, flag as Unknown
+      TRUE ~ "Unknown"
     )
   ) %>%
   ungroup() %>%
-  
-  # Strip data processing structural helpers to deliver clean final tables
-  select(-is_invalid_history, -has_standing_dead, -first_obs_is_stump, -has_turned_stump)
+  # Remove temporary list and counter columns to keep the dataframe clean
+  select(-valid_species_list, -distinct_real_species_count)
 
 
-# ==============================================================================
-# SEQUENCE REVISION OF STATUS TRAJECTORIES
-# ==============================================================================
+# Kontrola birth a death podle plot_timeline, jestli tam nejsou nějaké nesmysly 
+# (záhadné birth a death)
 
-trees_dead3 <- trees_dead3 %>%
-  # Group by individual stem to track its precise historical development
-  group_by(composed_site_id, plot_id, tree_id, stem_id) %>%
-  # Crucial: Sort by rank_inventory to ensure timeline flows from past to future
-  arrange(rank_inventory, .by_group = TRUE) %>%
-  mutate(
-    # Get the status from the PREVIOUS inventory year
-    previous_status = lag(status),
-    
-    # Construct the status_check trajectory
-    status_check = case_when(
-      # If there is no previous record, it's the beginning of the tree's history
-      is.na(previous_status) ~ paste0("START_", status),
-      
-      # Standard transition case: Combine previous and current status (e.g., "AC_DF")
-      TRUE ~ paste0(previous_status, "_", status)
-    )
-  ) %>%
-  ungroup() %>%
-  # Clean up the temporary helper column
-  select(-previous_status)
+# Test na přeskakující stromy
 
-library(dplyr)
-
-# ==============================================================================
-# VALIDATION OF STATUS TRAJECTORIES (CREATING status_error)
-# ==============================================================================
-
-library(dplyr)
-
-
-trees_dead3 <- trees_dead3 %>%
-  mutate(
-    errorstatus_record = case_when(
-      # Special accepted cases (Minor measurement inconsistencies to be ignored)
-      status_check %in% c("DF_DC", "AF_AC", "AF_DC") ~ 0,
-      
-      # Stump errors: If DP is at the beginning of the pair and followed by anything else
-      grepl("^DP_", status_check) & !grepl("_DP$", status_check) ~ 1,
-      
-      # Zombie errors: Dead trees becoming alive again (DC or DF transitioning to AC, AF, or A)
-      status_check %in% c("DC_AC", "DC_AF", "DC_A", 
-                          "DF_AC", "DF_AF", "DF_A") ~ 1,
-      
-      # Broad zombie check safety net (Any D/DC/DF to A/AC/AF transition)
-      grepl("^(DC_|DF_|D_)", status_check) & grepl("(_AC|_AF|_A)$", status_check) ~ 1,
-      
-      # All other cases are correct
-      TRUE ~ 0
-    )
-  )
-
-# 2. SAFE AGGREGATION TO errorstatus_tree VIA HELPER LISTS
-# ==============================================================================
-
-# A. Error list for STANDARD sites (grouped by plot_id)
-bad_stems_standard <- trees_dead3 %>%
-  filter(!composed_site_id %in% target_sites) %>%
-  group_by(composed_site_id, plot_id, tree_id, stem_id) %>%
-  summarise(has_error_standard = if_else(any(errorstatus_record == 1), 1, 0), .groups = "drop") %>%
-  filter(has_error_standard == 1)
-
-# B. Error list for VUK target sites (globally pooled, ignoring plot_id)
-bad_stems_vuk <- trees_dead3 %>%
-  filter(composed_site_id %in% target_sites) %>%
-  group_by(composed_site_id, tree_id, stem_id) %>%
-  summarise(has_error_vuk = if_else(any(errorstatus_record == 1), 1, 0), .groups = "drop") %>%
-  filter(has_error_vuk == 1)
-
-# 3. DATASET RE-ASSEMBLY & FINAL FORMATION OF errorstatus_tree
-# ==============================================================================
-
-trees_dead3 <- trees_dead3 %>%
-  # Map error indicators from standard plots
-  left_join(bad_stems_standard, by = c("composed_site_id", "plot_id", "tree_id", "stem_id")) %>%
-  # Map error indicators from pooled VUK sites
-  left_join(bad_stems_vuk, by = c("composed_site_id", "tree_id", "stem_id")) %>%
-  
-  # Assign final tree-level error based on where the error flags were matched
-  mutate(
-    errorstatus_tree = case_when(
-      composed_site_id %in% target_sites & has_error_vuk == 1 ~ 1,
-      !composed_site_id %in% target_sites & has_error_standard == 1 ~ 1,
-      TRUE ~ 0
-    )
-  ) %>%
-  # Clean up temporary columns from joins
-  select(-has_error_standard, -has_error_vuk)
-
-
-# KONTROLA BIRTH AND DEATH PODLE TAB. TIMELINE
-
-
-# TASK - THRESHOLDS (e.g. exclude records)
-# 
 
