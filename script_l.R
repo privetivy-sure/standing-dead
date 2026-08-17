@@ -1,6 +1,8 @@
-#
-# Basic functions
+# R SCRIPT FOR FILTERING AND ADJUSTING LYING STEMS FOR BASTA ANALYSIS
 # ==============================================================================
+
+# Basic functions
+# ------------------------------------------------------------------------------
 
 
 write.table(sites_clima, 
@@ -41,8 +43,9 @@ site_characteristics <- trees_50_new %>%
   distinct()
 
 # ==============================================================================
+# Project: BaSTA (Survival / Persistence) Analysis for Lying Deadwood
 # DATA PREPARATION: UNIQUE IDs AND INVENTORY FILTERING
-# Project: Lying Deadwood Analysis 
+# 
 # ==============================================================================
 
 library(tidyr)
